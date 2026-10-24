@@ -21,6 +21,14 @@ inline float hsum256(__m256 v) {
     return _mm_cvtss_f32(sum);
 }
 
+// Plain scalar dot product. Kept as the naive baseline the benchmark measures
+// the SIMD kernel against (and as a reference for the SIMD path).
+inline float dot_scalar(const float* a, const float* b, std::size_t n) {
+    float s = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
 // Dot product of two float vectors using AVX2 + FMA, with a scalar tail.
 // This is the scalar-free building block the whole engine leans on.
 inline float dot(const float* a, const float* b, std::size_t n) {

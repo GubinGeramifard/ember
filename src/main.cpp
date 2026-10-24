@@ -25,15 +25,18 @@ int argmax(std::span<const float> v) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <model.bin> <tokenizer.bin> [prompt] [steps]\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s <model.bin> <tokenizer.bin> [prompt] [steps] [threads]\n",
+                     argv[0]);
         return 1;
     }
     const std::string model_path = argv[1];
     const std::string tok_path = argv[2];
     const std::string prompt = argc > 3 ? argv[3] : "";
     int steps = argc > 4 ? std::atoi(argv[4]) : 256;
+    const unsigned threads = argc > 5 ? static_cast<unsigned>(std::atoi(argv[5])) : 0;
 
-    ember::Transformer model(model_path);
+    ember::Transformer model(model_path, threads);
     ember::Tokenizer tok(tok_path, model.config().vocab_size);
 
     if (steps <= 0 || steps > model.config().seq_len) steps = model.config().seq_len;

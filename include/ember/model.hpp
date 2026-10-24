@@ -10,8 +10,13 @@
 #include <vector>
 
 #include "ember/config.hpp"
+#include "ember/threadpool.hpp"
 
 namespace ember {
+
+// Which dot-product kernel the matmul uses. Scalar is the naive baseline;
+// Simd is the AVX2 + FMA path. Selectable so the benchmark can compare them.
+enum class Kernel { Scalar, Simd };
 
 // Views into the loaded weight buffer. Nothing here owns memory; the backing
 // store lives in Transformer::storage_. Pointers follow the exact on-disk order.
@@ -46,21 +51,30 @@ struct RunState {
 class Transformer {
 public:
     // Load a checkpoint in the Llama-2 (llama2.c) binary format.
-    explicit Transformer(const std::string& checkpoint_path);
+    //   n_threads: matmul parallelism; 0 means use all hardware threads.
+    //   kernel:    dot-product implementation (SIMD by default).
+    explicit Transformer(const std::string& checkpoint_path, unsigned n_threads = 0,
+                         Kernel kernel = Kernel::Simd);
 
     // Run one decode step for `token` at position `pos`; returns logits (vocab_size).
     // The span is valid until the next call to forward().
     [[nodiscard]] std::span<const float> forward(int token, int pos);
 
     [[nodiscard]] const Config& config() const noexcept { return config_; }
+    [[nodiscard]] unsigned threads() const noexcept { return pool_.size(); }
+    [[nodiscard]] Kernel kernel() const noexcept { return kernel_; }
 
 private:
     void map_weights(bool shared_classifier);
+    // xout(d) = W(d,n) @ x(n), parallelized across the pool with the active kernel.
+    void matmul(float* xout, const float* x, const float* w, int n, int d);
 
     Config config_{};
     std::vector<std::byte> storage_;  // owns the entire weight buffer
     Weights w_{};
     RunState s_{};
+    Kernel kernel_;
+    ThreadPool pool_;
 };
 
 }  // namespace ember

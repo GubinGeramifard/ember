@@ -23,20 +23,28 @@ else()
   target_compile_options(ember_flags INTERFACE -mavx2 -mfma)
 endif()
 
+find_package(Threads REQUIRED)
+
 # Core engine library.
 add_library(ember STATIC
   src/model.cpp
   src/tokenizer.cpp)
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(ember PUBLIC ember_flags)
+target_link_libraries(ember PUBLIC ember_flags Threads::Threads)
 
 # CLI entry point.
 add_executable(ember_cli src/main.cpp)
 target_link_libraries(ember_cli PRIVATE ember)
 set_target_properties(ember_cli PROPERTIES OUTPUT_NAME ember)
 
-# Statically link the GCC/libstdc++ runtime so the binary is self-contained and
-# does not pick up a mismatched libstdc++-6.dll from elsewhere on the system PATH.
+# Benchmark harness: measures the optimization journey (scalar -> SIMD -> threads).
+add_executable(ember_bench bench/bench.cpp)
+target_link_libraries(ember_bench PRIVATE ember)
+set_target_properties(ember_bench PROPERTIES OUTPUT_NAME bench)
+
+# Statically link the GCC/libstdc++ runtime so the binaries are self-contained
+# and do not pick up a mismatched libstdc++-6.dll from elsewhere on the PATH.
 if(MINGW)
   target_link_options(ember_cli PRIVATE -static -static-libgcc -static-libstdc++)
+  target_link_options(ember_bench PRIVATE -static -static-libgcc -static-libstdc++)
 endif()

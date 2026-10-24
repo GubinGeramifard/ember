@@ -6,8 +6,18 @@ ember loads a Llama-2 architecture model (RMSNorm, rotary position embeddings, g
 
 ## Status
 
-- **Correctness: verified.** Greedy decoding is **byte-for-byte identical** to the reference implementation across every test prompt. Correctness is proven, not assumed.
-- **Performance: ~270 tok/s** single-threaded on a TinyStories 15M model (AMD Ryzen 5 2600), with the SIMD dot-product kernel. Multithreading and quantization are next.
+- **Correctness: verified.** Greedy decoding is **byte-for-byte identical** to the reference implementation across every test prompt, and every optimization (SIMD, each thread count) reproduces the exact same tokens. Correctness is proven, not assumed.
+- **Performance** (AMD Ryzen 5 2600, 6 cores / 12 threads, TinyStories models):
+
+  | kernel | 15M tok/s | 110M tok/s |
+  |---|---|---|
+  | scalar, 1 thread | 75 | 9.6 |
+  | AVX2+FMA, 1 thread | 192 (2.6x) | 24.9 (2.6x) |
+  | AVX2+FMA, 4 threads | 264 (3.5x) | 34.6 (3.6x) |
+
+- **Key finding:** threading stops helping past ~4 threads because fp32 inference is
+  **memory-bandwidth-bound** (every token streams all weights from RAM). The right next
+  move is to move *less* data: int8 quantization (Phase 3).
 
 ## Build
 
@@ -38,6 +48,6 @@ model and its tokenizer are small enough to run in well under a second per respo
 ## Roadmap
 
 1. ~~Correct fp32 forward pass, verified against a reference.~~ **Done.**
-2. Multithreaded matmul (scale across cores).
+2. ~~Multithreaded matmul + benchmark harness.~~ **Done** (revealed the memory-bandwidth ceiling).
 3. Int8 quantization (smaller, faster) with a measured accuracy/speed tradeoff.
-4. Benchmark suite, tests, CI, and a writeup of the optimization journey.
+4. Tests, CI, and a writeup of the optimization journey.

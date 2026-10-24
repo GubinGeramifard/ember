@@ -1,9 +1,11 @@
 #include "ember/model.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 #include "ember/simd.hpp"
 
@@ -30,13 +32,6 @@ void softmax(float* x, int size) {
     for (int i = 0; i < size; ++i) x[i] /= sum;
 }
 
-// xout(d) = W(d,n) @ x(n). Each output is one dot product, vectorized with AVX2.
-void matmul(float* xout, const float* x, const float* w, int n, int d) {
-    for (int i = 0; i < d; ++i) {
-        xout[i] = dot(w + static_cast<std::size_t>(i) * n, x, static_cast<std::size_t>(n));
-    }
-}
-
 }  // namespace
 
 void RunState::allocate(const Config& c) {
@@ -53,7 +48,32 @@ void RunState::allocate(const Config& c) {
     value_cache.assign(static_cast<std::size_t>(c.n_layers) * c.seq_len * kv_dim, 0.0f);
 }
 
-Transformer::Transformer(const std::string& checkpoint_path) {
+namespace {
+unsigned resolve_threads(unsigned requested) {
+    if (requested != 0) return requested;
+    const unsigned hw = std::thread::hardware_concurrency();
+    return hw == 0 ? 1 : hw;
+}
+}  // namespace
+
+// xout(d) = W(d,n) @ x(n): each output row is one dot product. The d rows are
+// split across the thread pool, and each uses the selected kernel.
+void Transformer::matmul(float* xout, const float* x, const float* w, int n, int d) {
+    const Kernel k = kernel_;
+    pool_.parallel_for(d, [=](int begin, int end) {
+        if (k == Kernel::Simd) {
+            for (int i = begin; i < end; ++i)
+                xout[i] = dot(w + static_cast<std::size_t>(i) * n, x, static_cast<std::size_t>(n));
+        } else {
+            for (int i = begin; i < end; ++i)
+                xout[i] = dot_scalar(w + static_cast<std::size_t>(i) * n, x,
+                                     static_cast<std::size_t>(n));
+        }
+    });
+}
+
+Transformer::Transformer(const std::string& checkpoint_path, unsigned n_threads, Kernel kernel)
+    : kernel_(kernel), pool_(resolve_threads(n_threads)) {
     std::ifstream file(checkpoint_path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("ember: cannot open checkpoint " + checkpoint_path);
     const std::streamsize size = file.tellg();
