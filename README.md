@@ -1,5 +1,7 @@
 # ember
 
+[![ci](https://github.com/GubinGeramifard/ember/actions/workflows/ci.yml/badge.svg)](https://github.com/GubinGeramifard/ember/actions/workflows/ci.yml)
+
 A CPU inference engine for transformer language models, written from scratch in modern C++20.
 
 ember loads a Llama-2 architecture model (RMSNorm, rotary position embeddings, grouped-query attention, SwiGLU feed-forward) and runs autoregressive text generation on the CPU, with a hand-vectorized AVX2 + FMA kernel at its core. No GPU, no external ML dependencies, just the standard library and SIMD intrinsics.
@@ -57,6 +59,8 @@ model and its tokenizer are small enough to run in well under a second per respo
 - **Int8 group quantization (Q8_0)** with per-group fp32 scales, dynamic activation quantization, and a signed AVX2 int8 dot (`_mm256_sign_epi8` + `maddubs`). The fp32 weights are freed after quantizing, so only the int8 copy stays resident.
 - **KV cache** so each step only computes attention against cached keys and values.
 - **RAII throughout**: the model owns its buffers; activation scratch and the KV cache are allocated once and reused.
+
+See [DESIGN.md](DESIGN.md) for the architecture and the full optimization journey.
 
 ## Roadmap
 

@@ -42,9 +42,17 @@ add_executable(ember_bench bench/bench.cpp)
 target_link_libraries(ember_bench PRIVATE ember)
 set_target_properties(ember_bench PROPERTIES OUTPUT_NAME bench)
 
+# Test suite.
+enable_testing()
+add_executable(ember_tests tests/test_ember.cpp)
+target_link_libraries(ember_tests PRIVATE ember)
+set_target_properties(ember_tests PROPERTIES OUTPUT_NAME tests)
+add_test(NAME ember_tests COMMAND tests)
+
 # Statically link the GCC/libstdc++ runtime so the binaries are self-contained
 # and do not pick up a mismatched libstdc++-6.dll from elsewhere on the PATH.
 if(MINGW)
   target_link_options(ember_cli PRIVATE -static -static-libgcc -static-libstdc++)
   target_link_options(ember_bench PRIVATE -static -static-libgcc -static-libstdc++)
+  target_link_options(ember_tests PRIVATE -static -static-libgcc -static-libstdc++)
 endif()

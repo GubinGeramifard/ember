@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        # EMBER_NATIVE=OFF builds a portable AVX2 + FMA binary rather than tuning
+        # for the runner's exact CPU. GitHub's Linux runners support AVX2.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DEMBER_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        # Model weights are not in the repo, so the data-dependent tests skip;
+        # the SIMD, thread-pool, and quantization unit tests always run.
+        run: ctest --test-dir build --output-on-failure
