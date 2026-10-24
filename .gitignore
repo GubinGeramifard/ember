@@ -1,0 +1,17 @@
+# Build output
+build/
+*.o
+*.obj
+*.exe
+
+# Model weights and data (large binaries, downloaded or exported, never committed)
+*.bin
+*.gguf
+models/
+data/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
