@@ -1,6 +1,11 @@
 // Benchmark harness: measures the optimization journey from a naive scalar
-// baseline to the SIMD kernel to multithreaded matmul, and confirms that every
-// configuration produces the *same* tokens (optimizing must never change output).
+// baseline through the SIMD kernel, multithreading, and int8 quantization.
+//
+// Two numbers per configuration:
+//   tok/s   - throughput, from free generation
+//   agree%  - fraction of next-token predictions that match the fp32 model,
+//             measured by teacher-forcing the fp32 reference sequence. fp32
+//             configs are 100% by construction; int8 shows its (small) cost.
 //
 // Usage: bench <model.bin> <tokenizer.bin> [steps]
 #include <algorithm>
@@ -24,16 +29,13 @@ int argmax(std::span<const float> v) {
     return best;
 }
 
-struct Result {
-    std::vector<int> tokens;
-    double tok_per_s = 0.0;
-};
-
-// Greedily generate `steps` tokens from `prompt`, timing the whole loop.
-Result run(ember::Transformer& model, const ember::Tokenizer& tok, const std::string& prompt,
-           int steps) {
+// Free greedy generation; returns the full token sequence fed (seq[0] = first
+// prompt token, then each produced token) and the throughput in tokens/sec.
+std::pair<std::vector<int>, double> generate(ember::Transformer& model,
+                                             const ember::Tokenizer& tok,
+                                             const std::string& prompt, int steps) {
     const std::vector<int> prompt_tokens = tok.encode(prompt, /*bos=*/true, /*eos=*/false);
-    Result r;
+    std::vector<int> seq{prompt_tokens[0]};
     int token = prompt_tokens[0];
     int pos = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -43,12 +45,22 @@ Result run(ember::Transformer& model, const ember::Tokenizer& tok, const std::st
                                                                       : argmax(logits);
         ++pos;
         if (next == 1) break;
-        r.tokens.push_back(next);
+        seq.push_back(next);
         token = next;
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    r.tok_per_s = secs > 0.0 ? pos / secs : 0.0;
-    return r;
+    return {seq, secs > 0.0 ? pos / secs : 0.0};
+}
+
+// Teacher-forced next-token agreement with a reference sequence.
+double agreement(ember::Transformer& model, const std::vector<int>& ref) {
+    int matches = 0, total = 0;
+    for (std::size_t pos = 0; pos + 1 < ref.size(); ++pos) {
+        const auto logits = model.forward(ref[pos], static_cast<int>(pos));
+        if (argmax(logits) == ref[pos + 1]) ++matches;
+        ++total;
+    }
+    return total ? 100.0 * matches / total : 0.0;
 }
 
 }  // namespace
@@ -62,44 +74,47 @@ int main(int argc, char** argv) {
     const std::string tok_path = argv[2];
     const int steps = argc > 3 ? std::atoi(argv[3]) : 256;
     const std::string prompt = "Once upon a time";
-
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
 
-    // (label, threads, kernel). Build the thread-count ladder up to the machine's max.
+    // fp32 reference sequence (what every config is scored against).
+    std::vector<int> reference;
+    {
+        ember::Transformer ref(model_path, hw, ember::Kernel::Simd, /*quantize=*/false);
+        ember::Tokenizer tok(tok_path, ref.config().vocab_size);
+        reference = generate(ref, tok, prompt, steps).first;
+    }
+
     struct Cfg {
         std::string label;
         unsigned threads;
         ember::Kernel kernel;
+        bool quantize;
     };
-    std::vector<Cfg> cfgs;
-    cfgs.push_back({"scalar  x1", 1, ember::Kernel::Scalar});
-    cfgs.push_back({"simd    x1", 1, ember::Kernel::Simd});
-    for (unsigned t : {2u, 4u, 6u, 8u, 12u, 16u}) {
-        if (t <= hw) cfgs.push_back({"simd    x" + std::to_string(t), t, ember::Kernel::Simd});
-    }
-    if (cfgs.back().threads != hw)
-        cfgs.push_back({"simd    x" + std::to_string(hw), hw, ember::Kernel::Simd});
+    const std::vector<Cfg> cfgs = {
+        {"scalar  x1", 1, ember::Kernel::Scalar, false},
+        {"simd    x1", 1, ember::Kernel::Simd, false},
+        {"simd    x4", std::min(4u, hw), ember::Kernel::Simd, false},
+        {"simd    x" + std::to_string(hw), hw, ember::Kernel::Simd, false},
+        {"int8    x1", 1, ember::Kernel::Simd, true},
+        {"int8    x4", std::min(4u, hw), ember::Kernel::Simd, true},
+        {"int8    x" + std::to_string(hw), hw, ember::Kernel::Simd, true},
+    };
 
     std::printf("ember benchmark  |  %d steps, prompt \"%s\"  |  %u hardware threads\n\n",
                 steps, prompt.c_str(), hw);
-    std::printf("%-14s %12s %10s %9s\n", "config", "tok/s", "speedup", "output");
-    std::printf("%-14s %12s %10s %9s\n", "------", "-----", "-------", "------");
+    std::printf("%-12s %12s %10s %9s\n", "config", "tok/s", "speedup", "agree%");
+    std::printf("%-12s %12s %10s %9s\n", "------", "-----", "-------", "------");
 
     double baseline = 0.0;
-    std::vector<int> reference_tokens;
     for (const Cfg& c : cfgs) {
-        ember::Transformer model(model_path, c.threads, c.kernel);
+        ember::Transformer model(model_path, c.threads, c.kernel, c.quantize);
         ember::Tokenizer tok(tok_path, model.config().vocab_size);
-        const Result r = run(model, tok, prompt, steps);
-
-        if (reference_tokens.empty()) {
-            reference_tokens = r.tokens;
-            baseline = r.tok_per_s;
-        }
-        const bool same = (r.tokens == reference_tokens);
-        std::printf("%-14s %12.1f %9.2fx %9s\n", c.label.c_str(), r.tok_per_s,
-                    baseline > 0 ? r.tok_per_s / baseline : 0.0, same ? "ok" : "DIFFERS");
+        const double tps = generate(model, tok, prompt, steps).second;
+        const double agree = agreement(model, reference);
+        if (baseline == 0.0) baseline = tps;
+        std::printf("%-12s %12.1f %9.2fx %8.1f%%\n", c.label.c_str(), tps,
+                    baseline > 0 ? tps / baseline : 0.0, agree);
     }
-    std::printf("\n(\"ok\" = produced byte-identical tokens to the scalar baseline)\n");
+    std::printf("\n(agree%% = next-token match vs the fp32 model; int8 trades a little for speed)\n");
     return 0;
 }

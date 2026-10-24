@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ember/config.hpp"
+#include "ember/quant.hpp"
 #include "ember/threadpool.hpp"
 
 namespace ember {
@@ -17,6 +18,14 @@ namespace ember {
 // Which dot-product kernel the matmul uses. Scalar is the naive baseline;
 // Simd is the AVX2 + FMA path. Selectable so the benchmark can compare them.
 enum class Kernel { Scalar, Simd };
+
+// A weight matrix as seen by matmul: either fp32 rows, or int8 rows with scales.
+struct Linear {
+    const float* f = nullptr;        // fp32 weights (row-major), or
+    const std::int8_t* q = nullptr;  // int8 weights, with
+    const float* s = nullptr;        // per-group scales
+    [[nodiscard]] bool quantized() const noexcept { return q != nullptr; }
+};
 
 // Views into the loaded weight buffer. Nothing here owns memory; the backing
 // store lives in Transformer::storage_. Pointers follow the exact on-disk order.
@@ -45,6 +54,9 @@ struct RunState {
     std::vector<float> key_cache;    // (layer, seq_len, kv_dim)
     std::vector<float> value_cache;  // (layer, seq_len, kv_dim)
 
+    std::vector<std::int8_t> xq;     // scratch: quantized activation
+    std::vector<float> xs;           // scratch: activation group scales
+
     void allocate(const Config& c);
 };
 
@@ -52,9 +64,10 @@ class Transformer {
 public:
     // Load a checkpoint in the Llama-2 (llama2.c) binary format.
     //   n_threads: matmul parallelism; 0 means use all hardware threads.
-    //   kernel:    dot-product implementation (SIMD by default).
+    //   kernel:    fp32 dot-product implementation (SIMD by default).
+    //   quantize:  if true, quantize weights to int8 and free the fp32 copy.
     explicit Transformer(const std::string& checkpoint_path, unsigned n_threads = 0,
-                         Kernel kernel = Kernel::Simd);
+                         Kernel kernel = Kernel::Simd, bool quantize = false);
 
     // Run one decode step for `token` at position `pos`; returns logits (vocab_size).
     // The span is valid until the next call to forward().
@@ -63,18 +76,30 @@ public:
     [[nodiscard]] const Config& config() const noexcept { return config_; }
     [[nodiscard]] unsigned threads() const noexcept { return pool_.size(); }
     [[nodiscard]] Kernel kernel() const noexcept { return kernel_; }
+    [[nodiscard]] bool quantized() const noexcept { return quantized_; }
 
 private:
     void map_weights(bool shared_classifier);
-    // xout(d) = W(d,n) @ x(n), parallelized across the pool with the active kernel.
-    void matmul(float* xout, const float* x, const float* w, int n, int d);
+    void quantize_weights(bool shared_classifier);
+    // xout(d) = W(d,n) @ x(n), parallelized across the pool.
+    void matmul(float* xout, const Linear& w, const float* x, int n, int d);
+    // Build a Linear view of one layer's weight block (fp32 or quantized).
+    [[nodiscard]] Linear linear(const float* fbase, const QTensor& qt,
+                                unsigned long long rows_before, int n) const;
 
     Config config_{};
-    std::vector<std::byte> storage_;  // owns the entire weight buffer
+    std::vector<std::byte> storage_;  // owns the fp32 weight buffer (freed after quantizing)
     Weights w_{};
     RunState s_{};
     Kernel kernel_;
+    bool quantized_ = false;
     ThreadPool pool_;
+
+    // Quantized weights (populated only when quantized_). The classifier shares
+    // the token-embedding tensor when the checkpoint marks weights as shared.
+    QTensor q_token_emb_, q_wq_, q_wk_, q_wv_, q_wo_, q_w1_, q_w2_, q_w3_, q_wcls_;
+    const QTensor* q_cls_ = nullptr;
+    std::vector<float> rms_att_f_, rms_ffn_f_, rms_final_f_;  // norms kept in fp32
 };
 
 }  // namespace ember

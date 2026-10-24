@@ -26,7 +26,8 @@ int argmax(std::span<const float> v) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: %s <model.bin> <tokenizer.bin> [prompt] [steps] [threads]\n",
+                     "usage: %s <model.bin> <tokenizer.bin> [prompt] [steps] [threads] [q]\n"
+                     "  pass 'q' as the last argument to run the int8-quantized model\n",
                      argv[0]);
         return 1;
     }
@@ -35,8 +36,9 @@ int main(int argc, char** argv) {
     const std::string prompt = argc > 3 ? argv[3] : "";
     int steps = argc > 4 ? std::atoi(argv[4]) : 256;
     const unsigned threads = argc > 5 ? static_cast<unsigned>(std::atoi(argv[5])) : 0;
+    const bool quantize = argc > 6 && std::string(argv[6]) == "q";
 
-    ember::Transformer model(model_path, threads);
+    ember::Transformer model(model_path, threads, ember::Kernel::Simd, quantize);
     ember::Tokenizer tok(tok_path, model.config().vocab_size);
 
     if (steps <= 0 || steps > model.config().seq_len) steps = model.config().seq_len;

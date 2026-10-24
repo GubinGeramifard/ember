@@ -46,6 +46,11 @@ void RunState::allocate(const Config& c) {
     logits.assign(c.vocab_size, 0.0f);
     key_cache.assign(static_cast<std::size_t>(c.n_layers) * c.seq_len * kv_dim, 0.0f);
     value_cache.assign(static_cast<std::size_t>(c.n_layers) * c.seq_len * kv_dim, 0.0f);
+
+    // Activation-quantization scratch, sized to the widest matmul input.
+    const int max_n = std::max(c.dim, c.hidden_dim);
+    xq.assign(max_n, 0);
+    xs.assign(max_n / kGroupSize, 0.0f);
 }
 
 namespace {
@@ -56,24 +61,47 @@ unsigned resolve_threads(unsigned requested) {
 }
 }  // namespace
 
-// xout(d) = W(d,n) @ x(n): each output row is one dot product. The d rows are
-// split across the thread pool, and each uses the selected kernel.
-void Transformer::matmul(float* xout, const float* x, const float* w, int n, int d) {
+Linear Transformer::linear(const float* fbase, const QTensor& qt, unsigned long long rows_before,
+                           int n) const {
+    if (quantized_)
+        return Linear{nullptr, qt.q.data() + rows_before * n,
+                      qt.s.data() + rows_before * (n / kGroupSize)};
+    return Linear{fbase + rows_before * n, nullptr, nullptr};
+}
+
+// xout(d) = W(d,n) @ x(n): each output row is one dot product, split across the
+// thread pool. Quantized weights use a dynamically-quantized activation.
+void Transformer::matmul(float* xout, const Linear& w, const float* x, int n, int d) {
+    if (w.quantized()) {
+        quantize_into(x, n, s_.xq.data(), s_.xs.data());  // serial, O(n)
+        const std::int8_t* xq = s_.xq.data();
+        const float* xs = s_.xs.data();
+        const std::int8_t* wq = w.q;
+        const float* ws = w.s;
+        pool_.parallel_for(d, [=](int begin, int end) {
+            for (int i = begin; i < end; ++i)
+                xout[i] = dot_q8(wq + static_cast<std::size_t>(i) * n,
+                                 ws + static_cast<std::size_t>(i) * (n / kGroupSize), xq, xs, n);
+        });
+        return;
+    }
     const Kernel k = kernel_;
+    const float* wf = w.f;
     pool_.parallel_for(d, [=](int begin, int end) {
         if (k == Kernel::Simd) {
             for (int i = begin; i < end; ++i)
-                xout[i] = dot(w + static_cast<std::size_t>(i) * n, x, static_cast<std::size_t>(n));
+                xout[i] = dot(wf + static_cast<std::size_t>(i) * n, x, static_cast<std::size_t>(n));
         } else {
             for (int i = begin; i < end; ++i)
-                xout[i] = dot_scalar(w + static_cast<std::size_t>(i) * n, x,
+                xout[i] = dot_scalar(wf + static_cast<std::size_t>(i) * n, x,
                                      static_cast<std::size_t>(n));
         }
     });
 }
 
-Transformer::Transformer(const std::string& checkpoint_path, unsigned n_threads, Kernel kernel)
-    : kernel_(kernel), pool_(resolve_threads(n_threads)) {
+Transformer::Transformer(const std::string& checkpoint_path, unsigned n_threads, Kernel kernel,
+                         bool quantize)
+    : kernel_(kernel), quantized_(quantize), pool_(resolve_threads(n_threads)) {
     std::ifstream file(checkpoint_path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("ember: cannot open checkpoint " + checkpoint_path);
     const std::streamsize size = file.tellg();
@@ -92,6 +120,47 @@ Transformer::Transformer(const std::string& checkpoint_path, unsigned n_threads,
 
     map_weights(shared_classifier);
     s_.allocate(config_);
+    if (quantized_) quantize_weights(shared_classifier);
+}
+
+// Quantize every large matrix to int8, copy the small norm weights out to fp32
+// vectors, then release the fp32 buffer so only the int8 weights stay resident.
+void Transformer::quantize_weights(bool shared_classifier) {
+    const Config& p = config_;
+    const auto L = static_cast<unsigned long long>(p.n_layers);
+    const auto dim = static_cast<unsigned long long>(p.dim);
+    const auto kv = static_cast<unsigned long long>(p.kv_dim());
+    const auto hid = static_cast<unsigned long long>(p.hidden_dim);
+    const auto vocab = static_cast<unsigned long long>(p.vocab_size);
+
+    q_token_emb_ = quantize(w_.token_embedding, vocab * dim);
+    q_wq_ = quantize(w_.wq, L * dim * dim);
+    q_wk_ = quantize(w_.wk, L * dim * kv);
+    q_wv_ = quantize(w_.wv, L * dim * kv);
+    q_wo_ = quantize(w_.wo, L * dim * dim);
+    q_w1_ = quantize(w_.w1, L * dim * hid);
+    q_w2_ = quantize(w_.w2, L * hid * dim);
+    q_w3_ = quantize(w_.w3, L * dim * hid);
+    if (shared_classifier) {
+        q_cls_ = &q_token_emb_;
+    } else {
+        q_wcls_ = quantize(w_.wcls, vocab * dim);
+        q_cls_ = &q_wcls_;
+    }
+
+    // Norms stay in fp32 (tiny, applied elementwise); copy them out of storage_.
+    rms_att_f_.assign(w_.rms_att, w_.rms_att + L * dim);
+    rms_ffn_f_.assign(w_.rms_ffn, w_.rms_ffn + L * dim);
+    rms_final_f_.assign(w_.rms_final, w_.rms_final + dim);
+
+    // Release the fp32 weights; repoint the norm views at the kept copies and
+    // null the rest so nothing accidentally reads the freed buffer.
+    storage_.clear();
+    storage_.shrink_to_fit();
+    w_ = Weights{};
+    w_.rms_att = rms_att_f_.data();
+    w_.rms_ffn = rms_ffn_f_.data();
+    w_.rms_final = rms_final_f_.data();
 }
 
 void Transformer::map_weights(bool shared_classifier) {
@@ -127,8 +196,14 @@ std::span<const float> Transformer::forward(int token, int pos) {
     const int head_size = p.head_size();
 
     float* x = s_.x.data();
-    std::memcpy(x, w_.token_embedding + static_cast<std::size_t>(token) * dim,
-                dim * sizeof(float));
+    if (quantized_) {
+        dequantize_row(q_token_emb_.q.data() + static_cast<std::size_t>(token) * dim,
+                       q_token_emb_.s.data() + static_cast<std::size_t>(token) * (dim / kGroupSize),
+                       x, dim);
+    } else {
+        std::memcpy(x, w_.token_embedding + static_cast<std::size_t>(token) * dim,
+                    dim * sizeof(float));
+    }
 
     for (unsigned long long l = 0; l < static_cast<unsigned long long>(p.n_layers); ++l) {
         rmsnorm(s_.xb.data(), x, w_.rms_att + l * dim, dim);
@@ -138,9 +213,9 @@ std::span<const float> Transformer::forward(int token, int pos) {
         float* k = s_.key_cache.data() + loff + static_cast<std::size_t>(pos) * kv_dim;
         float* v = s_.value_cache.data() + loff + static_cast<std::size_t>(pos) * kv_dim;
 
-        matmul(s_.q.data(), s_.xb.data(), w_.wq + l * dim * dim, dim, dim);
-        matmul(k, s_.xb.data(), w_.wk + l * dim * kv_dim, dim, kv_dim);
-        matmul(v, s_.xb.data(), w_.wv + l * dim * kv_dim, dim, kv_dim);
+        matmul(s_.q.data(), linear(w_.wq, q_wq_, l * dim, dim), s_.xb.data(), dim, dim);
+        matmul(k, linear(w_.wk, q_wk_, l * kv_dim, dim), s_.xb.data(), dim, kv_dim);
+        matmul(v, linear(w_.wv, q_wv_, l * kv_dim, dim), s_.xb.data(), dim, kv_dim);
 
         // RoPE: rotate (q, k) pairwise with position-dependent frequencies.
         for (int i = 0; i < dim; i += 2) {
@@ -183,24 +258,26 @@ std::span<const float> Transformer::forward(int token, int pos) {
             }
         }
 
-        matmul(s_.xb2.data(), s_.xb.data(), w_.wo + l * dim * dim, dim, dim);
+        matmul(s_.xb2.data(), linear(w_.wo, q_wo_, l * dim, dim), s_.xb.data(), dim, dim);
         for (int i = 0; i < dim; ++i) x[i] += s_.xb2[i];
 
         // Feed-forward: w2( silu(w1 x) * w3 x ).
         rmsnorm(s_.xb.data(), x, w_.rms_ffn + l * dim, dim);
-        matmul(s_.hb.data(), s_.xb.data(), w_.w1 + l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s_.hb2.data(), s_.xb.data(), w_.w3 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s_.hb.data(), linear(w_.w1, q_w1_, l * hidden_dim, dim), s_.xb.data(), dim, hidden_dim);
+        matmul(s_.hb2.data(), linear(w_.w3, q_w3_, l * hidden_dim, dim), s_.xb.data(), dim, hidden_dim);
         for (int i = 0; i < hidden_dim; ++i) {
             float val = s_.hb[i];
             val *= 1.0f / (1.0f + std::exp(-val));  // SiLU
             s_.hb[i] = val * s_.hb2[i];
         }
-        matmul(s_.xb.data(), s_.hb.data(), w_.w2 + l * dim * hidden_dim, hidden_dim, dim);
+        matmul(s_.xb.data(), linear(w_.w2, q_w2_, l * dim, hidden_dim), s_.hb.data(), hidden_dim, dim);
         for (int i = 0; i < dim; ++i) x[i] += s_.xb[i];
     }
 
     rmsnorm(x, x, w_.rms_final, dim);
-    matmul(s_.logits.data(), x, w_.wcls, p.dim, p.vocab_size);
+    const Linear cls = quantized_ ? Linear{nullptr, q_cls_->q.data(), q_cls_->s.data()}
+                                  : Linear{w_.wcls, nullptr, nullptr};
+    matmul(s_.logits.data(), cls, x, p.dim, p.vocab_size);
     return {s_.logits.data(), static_cast<std::size_t>(p.vocab_size)};
 }
 
